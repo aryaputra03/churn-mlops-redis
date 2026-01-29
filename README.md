@@ -1,7 +1,3 @@
-Tentu, ini adalah draf `README.md` untuk proyek Anda yang dirancang khusus untuk menonjolkan penggunaan **PostgreSQL (Supabase)** dan **Redis (Upstash)** untuk *rate limiting* dan *caching*, sesuai dengan struktur proyek prediksi *churn* yang terlihat pada file Anda.
-
----
-
 # 🔮 Churn Prediction API
 
 Proyek ini adalah layanan *Machine Learning* *end-to-end* untuk memprediksi tingkat *churn* pelanggan. Dibangun dengan **Python** dan **CatBoost**, aplikasi ini dioptimalkan untuk performa tinggi dan skalabilitas menggunakan **Supabase** sebagai database utama dan **Upstash Redis** untuk manajemen trafik dan caching.
