@@ -22,9 +22,9 @@ env:
   SECRET_KEY: ${{ secrets.SECRET_KEY }}
   TESTING: "true"
   DISABLE_RATE_LIMIT: "true"
-
   DATABASE_URL: sqlite:///./test_ci.db
   SKIP_DB_VERIFY: "true"
+  UPSTASH_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
 
 jobs:
   # ==========================================

@@ -1,8 +1,10 @@
 """
-FastAPI Main Application
+FastAPI Main Application - WITH UPSTASH REDIS CACHING
 
-REST API for customer churn prediction with database logging.
-Updated to use modern FastAPI lifespan events.
+Updated to use:
+- Upstash Redis for rate limiting
+- Intelligent caching for predictions
+- Cache invalidation on data changes
 """
 
 from dotenv import load_dotenv
@@ -46,6 +48,8 @@ from src.api.auth import (
 )
 from src.api.rate_limit import limiter, _rate_limit_exceeded_handler
 from src.api.ml_service import MLService
+from src.api.redis_client import redis_client, check_redis_health
+from src.api.cache_service import cache_service
 from src.utils import logger
 from sqlalchemy.orm import Session
 
@@ -58,11 +62,23 @@ from src.api.database import init_db, get_pool_status
 
 ml_service = MLService()
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Starting Churn Prediction API v2.0...")
+    logger.info("Starting Churn Prediction API v4.0...")
     Base.metadata.create_all(bind=engine)
+
+    redis_health = check_redis_health()
+    if redis_health["healthy"]:
+        logger.info("Upstash Redis connected")
+        logger.info(f"Redis Info: {redis_health['info']}")
+    else:
+        logger.warning("Redis not available - using fallback")
     
+    logger.info("Authentication enabled")
+    logger.info("Rate limiting enabled (Upstash)")
+    logger.info("Caching enabled (Upstash)")
+
     try:
         init_db()
         logger.info("Database initialized")
@@ -83,7 +99,7 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    logger.info("Shutting down...")
+    logger.info("Shutting down Churn Prediction API...")
 
 # ==========================================
 # FastAPI App Initialization
@@ -91,8 +107,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Churn Prediction API",
-    description="ML API with Supabase PostgreSQL, Authentication & Rate Limiting",
-    version="3.0.0",
+    description="ML API for customer churn prediction with Upstash Redis caching",
+    version="4.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan
@@ -104,7 +120,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 CORS_ORIGIN = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGIN,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -240,12 +256,18 @@ async def list_users(
 # ==========================================
 
 @app.get("/", response_model=dict, tags=["System"])
-@limiter.limit("2/minute")
+@limiter.limit("60/minute")
 async def root(request: Request):
     """Root endpoint"""
     return {
-        "message": "Churn Prediction API v2.0",
-        "features": ["Authentication", "Rate Limiting", "ML Predictions"],
+        "message": "Churn Prediction API v4.0",
+        "features": [
+            "Authentication", 
+            "Rate Limiting (Upstash)", 
+            "ML Predictions",
+            "Redis Caching (Upstash)",
+            "PostgreSQL (Supabase)"
+        ],
         "docs": "/docs",
         "auth": "/auth/token"
     }
@@ -265,15 +287,20 @@ async def health_check(request: Request):
             db_status = "connected"
         
         pool_status = get_pool_status()
+
         model_loaded = ml_service.is_model_loaded()
+        redis_health = check_redis_health()
+
         return HealthResponse(
-            status='healthy' if model_loaded else 'unhealthy',
+            status='healthy' if model_loaded and redis_health["healthy"] else 'unhealthy',
             model_loaded=model_loaded,
+            timestamp=datetime.utcnow(),
+            redis_status=redis_health["info"].get("status", "unknown"),
+            redis_type=redis_health["info"].get("type", "unknown"),
             database= {
                 "status": db_status,
                 "type": "postgresql" if "postgresql" in str(engine.url) else "sqlite"
             },
-            timestamp=datetime.utcnow()
         )
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
@@ -287,9 +314,17 @@ async def health_check(request: Request):
 
 @app.get("/model/info", response_model=ModelInfoResponse, tags=["System"])
 async def model_info():
-    """Get model information"""
+    """Get model information - WITH CACHING"""
     try:
+        cached_info = cache_service.get_model_info()
+        if cached_info:
+            logger.debug("Model info from cache")
+            return ModelInfoResponse(**cached_info)
+
         info = ml_service.get_model_info()
+
+        cache_service.set_model_info(info)
+
         return ModelInfoResponse(**info)
     except Exception as e:
         logger.error(f"Model info error: {str(e)}")
@@ -325,7 +360,7 @@ async def database_status(
         )
 
 # ==========================================
-# Protected Prediction Endpoints
+# Protected Prediction Endpoints WITH CACHING
 # ==========================================
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Predictions"])
@@ -337,7 +372,7 @@ async def predict_single(
     current_user: schemas.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    # ✅ Lazy loading
+    # Lazy loading
     if not ml_service.is_model_loaded():
         try:
             ml_service.load_model()
@@ -348,7 +383,21 @@ async def predict_single(
             )
     
     try:
-        input_data = pd.DataFrame([pred_request.dict()])
+        input_data_dict = pred_request.model_dump()
+        input_hash = cache_service.hash_input_data(input_data_dict)
+
+        cache_prediction = cache_service.get_prediction(
+            pred_request.customer_id,
+            input_hash
+        )
+
+        if cache_prediction:
+            logger.info(f"Cache HIT for customer {pred_request.customer_id}")
+            return PredictionResponse(**cache_prediction)
+        
+        logger.info(f"Cache MISS for customer {pred_request.customer_id}")
+
+        input_data = pd.DataFrame([input_data_dict])
         prediction, probability = ml_service.predict(input_data)
 
         response = PredictionResponse(
@@ -359,15 +408,27 @@ async def predict_single(
             timestamp=datetime.utcnow()
         )
 
+        cache_service.set_prediction(
+            pred_request.customer_id,
+            input_hash,
+            response.model_dump()
+        )
+
         background_tasks.add_task(
             crud.create_prediction_log,
             db=db,
             customer_id=pred_request.customer_id,
             prediction=response.prediction,
             probability=response.churn_probability,
-            input_data=pred_request.dict(),
+            input_data=input_data_dict,
             user_id=current_user.id
         )
+
+        background_tasks.add_task(
+            cache_service.invalidate_history,
+            current_user.id
+        )
+
         return response
     
     except Exception as e:

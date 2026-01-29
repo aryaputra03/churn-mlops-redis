@@ -243,6 +243,8 @@ class HealthResponse(BaseModel):
     model_loaded: bool = Field(alias="model_loaded")
     timestamp: datetime
     error: Optional[str] = None
+    redis_status: Optional[str] = None
+    redis_type: Optional[str] = None
     
     model_config = ConfigDict(
         populate_by_name=True,
@@ -252,7 +254,9 @@ class HealthResponse(BaseModel):
                 "status": "healthy",
                 "model_loaded": True,
                 "timestamp": "2024-01-15T10:30:00",
-                "error": None
+                "error": None,
+                "redis_status": "connected",
+                "redis_type": "upstash"
             }
         }
     )
